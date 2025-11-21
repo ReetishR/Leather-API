@@ -21,8 +21,12 @@ CLASS_LABELS = os.getenv(
 MODEL_PATH = os.getenv("MODEL_INCEPTION_PATH", "inception.h5")
 MODEL_URL = os.getenv("MODEL_INCEPTION_URL")
 TARGET_SIZE = (299, 299)
+ALEXNET_MODEL_PATH = os.getenv("MODEL_ALEXNET_PATH", "Alexnet.h5")
+ALEXNET_MODEL_URL = os.getenv("MODEL_ALEXNET_URL")
+ALEXNET_TARGET_SIZE = (227, 227)
+ALEXNET_AUTHENTIC_INDEX = int(os.getenv("ALEXNET_AUTHENTIC_INDEX", "1"))
 
-app = FastAPI(title="Leather Classifier API", version="1.0.0")
+app = FastAPI(title="Leather Classifier API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,6 +36,7 @@ app.add_middleware(
 )
 
 _model = None
+_alexnet_model = None
 
 
 def _load_model() -> tf.keras.Model:
@@ -62,6 +67,35 @@ def _load_model() -> tf.keras.Model:
     return _model
 
 
+def _load_alexnet_model() -> tf.keras.Model:
+    global _alexnet_model
+    if _alexnet_model is None:
+        if not os.path.exists(ALEXNET_MODEL_PATH):
+            if not ALEXNET_MODEL_URL:
+                raise FileNotFoundError(
+                    f"MODEL_ALEXNET_PATH not found at '{ALEXNET_MODEL_PATH}' and MODEL_ALEXNET_URL is not set."
+                )
+
+            dest_dir = os.path.dirname(ALEXNET_MODEL_PATH)
+            if dest_dir:
+                os.makedirs(dest_dir, exist_ok=True)
+
+            try:
+                with requests.get(ALEXNET_MODEL_URL, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    with open(ALEXNET_MODEL_PATH, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to download model from MODEL_ALEXNET_URL: {exc}"
+                ) from exc
+
+        _alexnet_model = tf.keras.models.load_model(ALEXNET_MODEL_PATH)
+    return _alexnet_model
+
+
 def _preprocess_image(data: bytes) -> np.ndarray:
     try:
         with Image.open(io.BytesIO(data)) as img:
@@ -83,6 +117,21 @@ def _preprocess_image(data: bytes) -> np.ndarray:
 
         array = np.expand_dims(np.array(canvas), axis=0)
         return preprocess_input(array)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
+
+
+def _preprocess_alexnet_image(data: bytes) -> np.ndarray:
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+            img = img.resize(ALEXNET_TARGET_SIZE, Image.Resampling.LANCZOS)
+
+        array = np.array(img).astype("float32") / 255.0
+        array = np.expand_dims(array, axis=0)
+        return array
     except Exception as exc:  # pragma: no cover - defensive guard
         raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
 
@@ -114,6 +163,27 @@ async def predict(file: UploadFile = File(...)) -> dict[str, float | str]:
 
     return {
         "prediction": label,
+        "confidence": float(np.max(scores)),
+    }
+
+
+@app.post("/authenticate", summary="Detect leather authenticity using AlexNet")
+async def authenticate_leather(
+    file: UploadFile = File(...),
+) -> dict[str, float | bool]:
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    model = _load_alexnet_model()
+    processed = _preprocess_alexnet_image(raw)
+    predictions = model.predict(processed)
+    scores = predictions[0]
+    class_index = int(np.argmax(scores))
+    authentic = class_index == ALEXNET_AUTHENTIC_INDEX
+
+    return {
+        "authentic": bool(authentic),
         "confidence": float(np.max(scores)),
     }
 

@@ -2,8 +2,10 @@
 Minimal FastAPI service that exposes the leather classifier as a JSON API.
 Run locally with: uvicorn simple_api:app --host 0.0.0.0 --port 8000
 """
+import gc
 import io
 import os
+import time
 from typing import Literal
 
 import numpy as np
@@ -40,8 +42,17 @@ _alexnet_model = None
 
 
 def _load_model() -> tf.keras.Model:
-    global _model
+    global _model, _alexnet_model
     if _model is None:
+        if _alexnet_model is not None:
+            try:
+                del _alexnet_model
+            except NameError:
+                pass
+            _alexnet_model = None
+            gc.collect()
+            tf.keras.backend.clear_session()
+
         if not os.path.exists(MODEL_PATH):
             # Try downloading the model if a URL is provided
             if not MODEL_URL:
@@ -63,7 +74,7 @@ def _load_model() -> tf.keras.Model:
             except Exception as exc:
                 raise RuntimeError(f"Failed to download model from MODEL_INCEPTION_URL: {exc}") from exc
 
-        _model = tf.keras.models.load_model(MODEL_PATH)
+        _model = tf.keras.models.load_model(MODEL_PATH, compile=False)
     return _model
 
 
@@ -92,7 +103,7 @@ def _load_alexnet_model() -> tf.keras.Model:
                     f"Failed to download model from MODEL_ALEXNET_URL: {exc}"
                 ) from exc
 
-        _alexnet_model = tf.keras.models.load_model(ALEXNET_MODEL_PATH)
+        _alexnet_model = tf.keras.models.load_model(ALEXNET_MODEL_PATH, compile=False)
     return _alexnet_model
 
 
@@ -147,6 +158,16 @@ async def predict(file: UploadFile = File(...)) -> dict[str, float | str]:
     if not raw:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
+    global _alexnet_model
+    if _alexnet_model is not None:
+        try:
+            del _alexnet_model
+        except NameError:
+            pass
+        _alexnet_model = None
+        gc.collect()
+        tf.keras.backend.clear_session()
+
     model = _load_model()
     processed = _preprocess_image(raw)
     predictions = model.predict(processed)
@@ -175,12 +196,52 @@ async def authenticate_leather(
     if not raw:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    model = _load_alexnet_model()
+    global _model, _alexnet_model
+
+    if _model is not None:
+        try:
+            del _model
+        except NameError:
+            pass
+        _model = None
+        gc.collect()
+        time.sleep(0.1)
+        gc.collect()
+
+    tf.keras.backend.clear_session()
+
+    try:
+        model = _load_alexnet_model()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except MemoryError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Not enough memory to load AlexNet model",
+        ) from exc
+
     processed = _preprocess_alexnet_image(raw)
-    predictions = model.predict(processed)
+
+    try:
+        predictions = model.predict(processed)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error during AlexNet inference: {exc}",
+        ) from exc
+
     scores = predictions[0]
     class_index = int(np.argmax(scores))
     authentic = class_index == ALEXNET_AUTHENTIC_INDEX
+
+    if _alexnet_model is not None:
+        try:
+            del _alexnet_model
+        except NameError:
+            pass
+        _alexnet_model = None
+        gc.collect()
+        tf.keras.backend.clear_session()
 
     return {
         "authentic": bool(authentic),

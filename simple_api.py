@@ -7,6 +7,7 @@ import os
 from typing import Literal
 
 import numpy as np
+import requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -18,6 +19,7 @@ CLASS_LABELS = os.getenv(
     "Buffalo,Cow,Goat,Sheep",
 ).split(",")
 MODEL_PATH = os.getenv("MODEL_INCEPTION_PATH", "inception.h5")
+MODEL_URL = os.getenv("MODEL_INCEPTION_URL")
 TARGET_SIZE = (299, 299)
 
 app = FastAPI(title="Leather Classifier API", version="1.0.0")
@@ -36,9 +38,26 @@ def _load_model() -> tf.keras.Model:
     global _model
     if _model is None:
         if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(
-                f"MODEL_INCEPTION_PATH not found at '{MODEL_PATH}'. Set the env var to the .h5 file."
-            )
+            # Try downloading the model if a URL is provided
+            if not MODEL_URL:
+                raise FileNotFoundError(
+                    f"MODEL_INCEPTION_PATH not found at '{MODEL_PATH}' and MODEL_INCEPTION_URL is not set."
+                )
+
+            dest_dir = os.path.dirname(MODEL_PATH)
+            if dest_dir:
+                os.makedirs(dest_dir, exist_ok=True)
+
+            try:
+                with requests.get(MODEL_URL, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    with open(MODEL_PATH, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to download model from MODEL_INCEPTION_URL: {exc}") from exc
+
         _model = tf.keras.models.load_model(MODEL_PATH)
     return _model
 
